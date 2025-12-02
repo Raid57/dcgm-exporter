@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"slices"
@@ -17,11 +19,24 @@ import (
 	"time"
 
 	"github.com/NVIDIA/go-dcgm/pkg/dcgm"
-	"github.com/sirupsen/logrus"
+	"github.com/fsnotify/fsnotify"
 	"github.com/urfave/cli/v2"
 
-	"github.com/NVIDIA/dcgm-exporter/pkg/dcgmexporter"
-	"github.com/NVIDIA/dcgm-exporter/pkg/stdout"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/appconfig"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/capabilities"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/collector"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/counters"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/dcgmprovider"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/devicewatcher"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/devicewatchlistmanager"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/hostname"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/logging"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/nvmlprovider"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/prerequisites"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/registry"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/server"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/stdout"
+	"github.com/NVIDIA/dcgm-exporter/internal/pkg/utils"
 )
 
 const (
@@ -51,30 +66,42 @@ const (
 )
 
 const (
-	CLIFieldsFile                 = "collectors"
-	CLIAddress                    = "address"
-	CLICollectInterval            = "collect-interval"
-	CLIKubernetes                 = "kubernetes"
-	CLIKubernetesGPUIDType        = "kubernetes-gpu-id-type"
-	CLIUseOldNamespace            = "use-old-namespace"
-	CLIRemoteHEInfo               = "remote-hostengine-info"
-	CLIGPUDevices                 = "devices"
-	CLISwitchDevices              = "switch-devices"
-	CLICPUDevices                 = "cpu-devices"
-	CLINoHostname                 = "no-hostname"
-	CLIUseFakeGPUs                = "fake-gpus"
-	CLIConfigMapData              = "configmap-data"
-	CLIWebSystemdSocket           = "web-systemd-socket"
-	CLIWebConfigFile              = "web-config-file"
-	CLIXIDCountWindowSize         = "xid-count-window-size"
-	CLIReplaceBlanksInModelName   = "replace-blanks-in-model-name"
-	CLIDebugMode                  = "debug"
-	CLIClockEventsCountWindowSize = "clock-events-count-window-size"
-	CLIEnableDCGMLog              = "enable-dcgm-log"
-	CLIDCGMLogLevel               = "dcgm-log-level"
-	CLIPodResourcesKubeletSocket  = "pod-resources-kubelet-socket"
-	CLIHPCJobMappingDir           = "hpc-job-mapping-dir"
-	CLINvidiaResourceNames        = "nvidia-resource-names"
+	CLIFieldsFile                       = "collectors"
+	CLIAddress                          = "address"
+	CLICollectInterval                  = "collect-interval"
+	CLIKubernetes                       = "kubernetes"
+	CLIKubernetesEnablePodLabels        = "kubernetes-enable-pod-labels"
+	CLIKubernetesEnablePodUID           = "kubernetes-enable-pod-uid"
+	CLIKubernetesGPUIDType              = "kubernetes-gpu-id-type"
+	CLIKubernetesPodLabelAllowlistRegex = "kubernetes-pod-label-allowlist-regex"
+	CLIKubernetesPodLabelCacheSize      = "kubernetes-pod-label-cache-size"
+	CLIUseOldNamespace                  = "use-old-namespace"
+	CLIRemoteHEInfo                     = "remote-hostengine-info"
+	CLIGPUDevices                       = "devices"
+	CLISwitchDevices                    = "switch-devices"
+	CLICPUDevices                       = "cpu-devices"
+	CLINoHostname                       = "no-hostname"
+	CLIUseFakeGPUs                      = "fake-gpus"
+	CLIConfigMapData                    = "configmap-data"
+	CLIWebSystemdSocket                 = "web-systemd-socket"
+	CLIWebConfigFile                    = "web-config-file"
+	CLIXIDCountWindowSize               = "xid-count-window-size"
+	CLIReplaceBlanksInModelName         = "replace-blanks-in-model-name"
+	CLIDebugMode                        = "debug"
+	CLIClockEventsCountWindowSize       = "clock-events-count-window-size"
+	CLIEnableDCGMLog                    = "enable-dcgm-log"
+	CLIDCGMLogLevel                     = "dcgm-log-level"
+	CLILogFormat                        = "log-format"
+	CLIPodResourcesKubeletSocket        = "pod-resources-kubelet-socket"
+	CLIHPCJobMappingDir                 = "hpc-job-mapping-dir"
+	CLINvidiaResourceNames              = "nvidia-resource-names"
+	CLIKubernetesVirtualGPUs            = "kubernetes-virtual-gpus"
+	CLIDumpEnabled                      = "dump-enabled"
+	CLIDumpDirectory                    = "dump-directory"
+	CLIDumpRetention                    = "dump-retention"
+	CLIDumpCompression                  = "dump-compression"
+	CLIKubernetesEnableDRA              = "kubernetes-enable-dra"
+	CLIDisableStartupValidate           = "disable-startup-validate"
 )
 
 func NewApp(buildVersion ...string) *cli.App {
@@ -148,12 +175,36 @@ func NewApp(buildVersion ...string) *cli.App {
 			Usage:   "Connect to remote hostengine at <HOST>:<PORT>",
 			EnvVars: []string{"DCGM_REMOTE_HOSTENGINE_INFO"},
 		},
+		&cli.BoolFlag{
+			Name:    CLIKubernetesEnablePodLabels,
+			Value:   false,
+			Usage:   "Enable kubernetes pod labels in metrics. This parameter is effective only when the '--kubernetes' option is set to 'true'.",
+			EnvVars: []string{"DCGM_EXPORTER_KUBERNETES_ENABLE_POD_LABELS"},
+		},
+		&cli.BoolFlag{
+			Name:    CLIKubernetesEnablePodUID,
+			Value:   false,
+			Usage:   "Enable kubernetes pod UID in metrics. This parameter is effective only when the '--kubernetes' option is set to 'true'.",
+			EnvVars: []string{"DCGM_EXPORTER_KUBERNETES_ENABLE_POD_UID"},
+		},
 		&cli.StringFlag{
 			Name:  CLIKubernetesGPUIDType,
-			Value: string(dcgmexporter.GPUUID),
+			Value: string(appconfig.GPUUID),
 			Usage: fmt.Sprintf("Choose Type of GPU ID to use to map kubernetes resources to pods. Possible values: '%s', '%s'",
-				dcgmexporter.GPUUID, dcgmexporter.DeviceName),
+				appconfig.GPUUID, appconfig.DeviceName),
 			EnvVars: []string{"DCGM_EXPORTER_KUBERNETES_GPU_ID_TYPE"},
+		},
+		&cli.StringSliceFlag{
+			Name:    CLIKubernetesPodLabelAllowlistRegex,
+			Value:   cli.NewStringSlice(),
+			Usage:   "Regex patterns for filtering pod labels to include in metrics (comma-separated). Empty means include all labels. This parameter is effective only when '--kubernetes-enable-pod-labels' is true.",
+			EnvVars: []string{"DCGM_EXPORTER_KUBERNETES_POD_LABEL_ALLOWLIST_REGEX"},
+		},
+		&cli.IntFlag{
+			Name:    CLIKubernetesPodLabelCacheSize,
+			Value:   150000,
+			Usage:   "Maximum number of label keys to cache for allowlist filtering. Larger values use more memory but reduce regex evaluations.",
+			EnvVars: []string{"DCGM_EXPORTER_KUBERNETES_POD_LABEL_CACHE_SIZE"},
 		},
 		&cli.StringFlag{
 			Name:    CLIGPUDevices,
@@ -185,7 +236,7 @@ func NewApp(buildVersion ...string) *cli.App {
 		&cli.StringFlag{
 			Name:    CLIWebConfigFile,
 			Value:   "",
-			Usage:   "TLS config file following webConfig spec.",
+			Usage:   "Web configuration file following webConfig spec: https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md.",
 			EnvVars: []string{"DCGM_EXPORTER_WEB_CONFIG_FILE"},
 		},
 		&cli.IntFlag{
@@ -222,9 +273,15 @@ func NewApp(buildVersion ...string) *cli.App {
 		},
 		&cli.StringFlag{
 			Name:    CLIDCGMLogLevel,
-			Value:   dcgmexporter.DCGMDbgLvlNone,
+			Value:   DCGMDbgLvlNone,
 			Usage:   "Specify the DCGM log verbosity level. This parameter is effective only when the '--enable-dcgm-log' option is set to 'true'. Possible values: NONE, FATAL, ERROR, WARN, INFO, DEBUG and VERB",
 			EnvVars: []string{"DCGM_EXPORTER_DCGM_LOG_LEVEL"},
+		},
+		&cli.StringFlag{
+			Name:    CLILogFormat,
+			Value:   "text",
+			Usage:   "Specify the log output format. Possible values: text, json",
+			EnvVars: []string{"DCGM_EXPORTER_LOG_FORMAT"},
 		},
 		&cli.StringFlag{
 			Name:    CLIPodResourcesKubeletSocket,
@@ -244,6 +301,48 @@ func NewApp(buildVersion ...string) *cli.App {
 			Usage:   "Nvidia resource names for specified GPU type like nvidia.com/a100, nvidia.com/a10.",
 			EnvVars: []string{"NVIDIA_RESOURCE_NAMES"},
 		},
+		&cli.BoolFlag{
+			Name:    CLIKubernetesVirtualGPUs,
+			Value:   false,
+			Usage:   "Capture metrics associated with virtual GPUs exposed by Kubernetes device plugins when using GPU sharing strategies, e.g. time-sharing or MPS.",
+			EnvVars: []string{"KUBERNETES_VIRTUAL_GPUS"},
+		},
+		&cli.BoolFlag{
+			Name:    CLIDumpEnabled,
+			Value:   false,
+			Usage:   "Enable file-based debugging dumps for troubleshooting",
+			EnvVars: []string{"DCGM_EXPORTER_DUMP_ENABLED"},
+		},
+		&cli.StringFlag{
+			Name:    CLIDumpDirectory,
+			Value:   "/tmp/dcgm-exporter-debug",
+			Usage:   "Directory to store debug dump files",
+			EnvVars: []string{"DCGM_EXPORTER_DUMP_DIRECTORY"},
+		},
+		&cli.IntFlag{
+			Name:    CLIDumpRetention,
+			Value:   24,
+			Usage:   "Retention period for debug dump files in hours (0 = no cleanup)",
+			EnvVars: []string{"DCGM_EXPORTER_DUMP_RETENTION"},
+		},
+		&cli.BoolFlag{
+			Name:    CLIDumpCompression,
+			Value:   true,
+			Usage:   "Use gzip compression for debug dump files",
+			EnvVars: []string{"DCGM_EXPORTER_DUMP_COMPRESSION"},
+		},
+		&cli.BoolFlag{
+			Name:    CLIKubernetesEnableDRA,
+			Value:   false,
+			Usage:   "Capture metrics associated with GPUs managed by Kubernetes Dynamic Resource Allocation (DRA) API.",
+			EnvVars: []string{"KUBERNETES_ENABLE_DRA"},
+		},
+		&cli.BoolFlag{
+			Name:    CLIDisableStartupValidate,
+			Value:   false,
+			Usage:   "Disable validation checks during startup. Can be useful for running in minimal environments or testing",
+			EnvVars: []string{"DISABLE_STARTUP_VALIDATE"},
+		},
 	}
 
 	if runtime.GOOS == "linux" {
@@ -255,7 +354,8 @@ func NewApp(buildVersion ...string) *cli.App {
 		})
 	} else {
 		err := "dcgm-exporter is only supported on Linux."
-		logrus.Fatal(err)
+		slog.Error(err)
+		fatal()
 		return nil
 	}
 
@@ -266,6 +366,10 @@ func NewApp(buildVersion ...string) *cli.App {
 	return c
 }
 
+func fatal() {
+	os.Exit(1)
+}
+
 func newOSWatcher(sigs ...os.Signal) chan os.Signal {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, sigs...)
@@ -274,169 +378,210 @@ func newOSWatcher(sigs ...os.Signal) chan os.Signal {
 }
 
 func action(c *cli.Context) (err error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	return stdout.Capture(ctx, func() error {
+	return stdout.Capture(context.Background(), func() error {
 		// The purpose of this function is to capture any panic that may occur
 		// during initialization and return an error.
 		defer func() {
 			if r := recover(); r != nil {
-				logrus.WithField(dcgmexporter.LoggerStackTrace, string(debug.Stack())).Error("Encountered a failure.")
+				slog.Error("Encountered a failure.", slog.String(logging.StackTrace, string(debug.Stack())))
 				err = fmt.Errorf("encountered a failure; err: %v", r)
 			}
 		}()
-		return startDCGMExporter(c, cancel)
+		return startDCGMExporter(c)
 	})
 }
 
-func startDCGMExporter(c *cli.Context, cancel context.CancelFunc) error {
-restart:
-
-	logrus.Info("Starting dcgm-exporter")
-
-	config, err := contextToConfig(c)
-	if err != nil {
-		return err
+func configureLogger(c *cli.Context) error {
+	logFormat := c.String(CLILogFormat)
+	logDebug := c.Bool(CLIDebugMode)
+	var opts slog.HandlerOptions
+	if logDebug {
+		opts.Level = slog.LevelDebug
+		defer slog.Debug("Debug output is enabled")
 	}
-
-	enableDebugLogging(config)
-
-	cleanupDCGM := initDCGM(config)
-	defer cleanupDCGM()
-
-	logrus.Info("DCGM successfully initialized!")
-
-	dcgm.FieldsInit()
-	defer dcgm.FieldsTerm()
-
-	fillConfigMetricGroups(config)
-
-	cs := getCounters(config)
-
-	fieldEntityGroupTypeSystemInfo := getFieldEntityGroupTypeSystemInfo(cs, config)
-
-	hostname, err := dcgmexporter.GetHostname(config)
-	if err != nil {
-		return err
+	switch logFormat {
+	case "text":
+		logger := slog.New(slog.NewTextHandler(os.Stderr, &opts))
+		slog.SetDefault(logger)
+	case "json":
+		// Use our custom JSON handler that properly handles complex structs
+		logging.SetupGlobalLogger(os.Stderr, &opts)
+	default:
+		return fmt.Errorf("invalid %s parameter values: %s", CLILogFormat, logFormat)
 	}
-
-	pipeline, cleanup, err := dcgmexporter.NewMetricsPipeline(config,
-		cs.DCGMCounters,
-		hostname,
-		dcgmexporter.NewDCGMCollector,
-		fieldEntityGroupTypeSystemInfo,
-	)
-	defer cleanup()
-	if err != nil {
-		logrus.Fatal(err)
-	}
-
-	cRegistry := dcgmexporter.NewRegistry()
-
-	enableDCGMExpXIDErrorsCountCollector(cs, fieldEntityGroupTypeSystemInfo, hostname, config, cRegistry)
-
-	enableDCGMExpClockEventsCount(cs, fieldEntityGroupTypeSystemInfo, hostname, config, cRegistry)
-
-	defer func() {
-		cRegistry.Cleanup()
-	}()
-
-	ch := make(chan string, 10)
-
-	var wg sync.WaitGroup
-	stop := make(chan interface{})
-
-	wg.Add(1)
-	go pipeline.Run(ch, stop, &wg)
-
-	wg.Add(1)
-
-	server, cleanup, err := dcgmexporter.NewMetricsServer(config, ch, cRegistry)
-	defer cleanup()
-	if err != nil {
-		return err
-	}
-
-	go server.Run(stop, &wg)
-
-	sigs := newOSWatcher(syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
-	sig := <-sigs
-	close(stop)
-	cancel()
-	err = dcgmexporter.WaitWithTimeout(&wg, time.Second*2)
-	if err != nil {
-		logrus.Fatal(err)
-	}
-
-	if sig == syscall.SIGHUP {
-		goto restart
-	}
-
 	return nil
 }
 
-func enableDCGMExpClockEventsCount(cs *dcgmexporter.CounterSet, fieldEntityGroupTypeSystemInfo *dcgmexporter.FieldEntityGroupTypeSystemInfo, hostname string, config *dcgmexporter.Config, cRegistry *dcgmexporter.Registry) {
-	if dcgmexporter.IsDCGMExpClockEventsCountEnabled(cs.ExporterCounters) {
-		item, exists := fieldEntityGroupTypeSystemInfo.Get(dcgm.FE_GPU)
-		if !exists {
-			logrus.Fatalf("%s collector cannot be initialized", dcgmexporter.DCGMClockEventsCount.String())
+func startDCGMExporter(c *cli.Context) error {
+	if err := configureLogger(c); err != nil {
+		return err
+	}
+
+	for {
+		// Create a new context for this run of the exporter
+		// Runs are ended by various events (signals from OS or DCGM)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		var version string
+		if c != nil && c.App != nil {
+			version = c.App.Version
 		}
-		clocksThrottleReasonsCollector, err := dcgmexporter.NewClockEventsCollector(
-			cs.ExporterCounters, hostname, config, item)
+
+		slog.Info("Starting dcgm-exporter", slog.String("Version", version))
+
+		config, err := contextToConfig(c)
 		if err != nil {
-			logrus.Fatal(err)
+			return err
 		}
 
-		cRegistry.Register(clocksThrottleReasonsCollector)
+		// Only validate prerequisites if not disabled.
+		if !config.DisableStartupValidate {
+			err = prerequisites.Validate()
+			if err != nil {
+				return err
+			}
+		}
 
-		logrus.Infof("%s collector initialized", dcgmexporter.DCGMClockEventsCount.String())
+		// Initialize DCGM Provider Instance
+		dcgmprovider.Initialize(config)
+		dcgmCleanup := dcgmprovider.Client().Cleanup
+
+		// Initialize NVML Provider Instance
+		err = nvmlprovider.Initialize()
+		if err != nil && !config.DisableStartupValidate {
+			return err // exit if we can't initialize nvml
+		}
+
+		nvmlCleanup := nvmlprovider.Client().Cleanup
+
+		slog.Info("DCGM successfully initialized!")
+		slog.Info("NVML provider successfully initialized!")
+
+		fillConfigMetricGroups(config)
+
+		cs := getCounters(config)
+
+		// Log capability information for debugging
+		if config.Debug {
+			capabilities.LogCapabilityInfo()
+		}
+
+		// Check and warn if profiling metrics are requested but CAP_SYS_ADMIN is missing
+		capabilities.WarnIfMissingProfilingCapabilities(cs.HasProfilingMetrics())
+
+		deviceWatchListManager := startDeviceWatchListManager(cs, config)
+
+		hostname, err := hostname.GetHostname(config)
+		if err != nil {
+			nvmlCleanup()
+			dcgmCleanup()
+			return err
+		}
+
+		cf := collector.InitCollectorFactory(cs, deviceWatchListManager, hostname, config)
+
+		cRegistry := registry.NewRegistry()
+		for _, entityCollector := range cf.NewCollectors() {
+			cRegistry.Register(entityCollector)
+		}
+
+		ch := make(chan string, 10)
+
+		var wg sync.WaitGroup
+		stop := make(chan interface{})
+
+		wg.Add(1)
+
+		server, cleanup, err := server.NewMetricsServer(config, ch, deviceWatchListManager, cRegistry)
+		if err != nil {
+			cRegistry.Cleanup()
+			nvmlCleanup()
+			dcgmCleanup()
+			return err
+		}
+
+		go server.Run(ctx, stop, &wg)
+
+		sigs := newOSWatcher(syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+
+		go watchCollectorsFile(config.CollectorsFile, reloadMetricsServer(sigs))
+
+		sig := <-sigs
+		slog.Info("Received signal", slog.String("signal", sig.String()))
+		close(stop)
+		cancel() // Cancel the context for this iteration
+		err = utils.WaitWithTimeout(&wg, time.Second*2)
+		if err != nil {
+			slog.Error(err.Error())
+			cRegistry.Cleanup()
+			nvmlCleanup()
+			dcgmCleanup()
+			cleanup()
+			fatal()
+		}
+
+		// Call cleanup functions before continuing the loop
+		cRegistry.Cleanup()
+		nvmlCleanup()
+		dcgmCleanup()
+		cleanup()
+
+		if sig != syscall.SIGHUP {
+			return nil
+		}
+
+		// For SIGHUP, we'll continue the loop after cleanup
+		slog.Info("Restarting dcgm-exporter after signal")
 	}
 }
 
-func enableDCGMExpXIDErrorsCountCollector(cs *dcgmexporter.CounterSet, fieldEntityGroupTypeSystemInfo *dcgmexporter.FieldEntityGroupTypeSystemInfo, hostname string, config *dcgmexporter.Config, cRegistry *dcgmexporter.Registry) {
-	if dcgmexporter.IsDCGMExpXIDErrorsCountEnabled(cs.ExporterCounters) {
-		item, exists := fieldEntityGroupTypeSystemInfo.Get(dcgm.FE_GPU)
-		if !exists {
-			logrus.Fatalf("%s collector cannot be initialized", dcgmexporter.DCGMXIDErrorsCount.String())
-		}
-
-		xidCollector, err := dcgmexporter.NewXIDCollector(cs.ExporterCounters, hostname, config, item)
-		if err != nil {
-			logrus.Fatal(err)
-		}
-
-		cRegistry.Register(xidCollector)
-
-		logrus.Infof("%s collector initialized", dcgmexporter.DCGMXIDErrorsCount.String())
-	}
-}
-
-func getFieldEntityGroupTypeSystemInfo(cs *dcgmexporter.CounterSet, config *dcgmexporter.Config) *dcgmexporter.FieldEntityGroupTypeSystemInfo {
-	var allCounters []dcgmexporter.Counter
+func startDeviceWatchListManager(
+	cs *counters.CounterSet, config *appconfig.Config,
+) devicewatchlistmanager.Manager {
+	// Create a list containing DCGM Collector, Exp Collectors and all the label Collectors
+	var allCounters counters.CounterList
+	var deviceWatchListManager devicewatchlistmanager.Manager
 
 	allCounters = append(allCounters, cs.DCGMCounters...)
 
 	allCounters = appendDCGMXIDErrorsCountDependency(allCounters, cs)
 	allCounters = appendDCGMClockEventsCountDependency(cs, allCounters)
 
-	fieldEntityGroupTypeSystemInfo := dcgmexporter.NewEntityGroupTypeSystemInfo(allCounters, config)
+	deviceWatchListManager = devicewatchlistmanager.NewWatchListManager(allCounters, config)
+	deviceWatcher := devicewatcher.NewDeviceWatcher()
 
-	for _, egt := range dcgmexporter.FieldEntityGroupTypeToMonitor {
-		err := fieldEntityGroupTypeSystemInfo.Load(egt)
+	for _, deviceType := range devicewatchlistmanager.DeviceTypesToWatch {
+		err := deviceWatchListManager.CreateEntityWatchList(deviceType, deviceWatcher, int64(config.CollectInterval))
 		if err != nil {
-			logrus.Infof("Not collecting %s metrics; %s", egt.String(), err)
+			slog.Info(fmt.Sprintf("Not collecting %s metrics; %s", deviceType.String(), err))
 		}
 	}
-	return fieldEntityGroupTypeSystemInfo
+	return deviceWatchListManager
+}
+
+func containsDCGMField(slice []counters.Counter, fieldID dcgm.Short) bool {
+	return slices.ContainsFunc(slice, func(counter counters.Counter) bool {
+		return uint16(counter.FieldID) == uint16(fieldID)
+	})
+}
+
+func containsExporterField(slice []counters.Counter, fieldID counters.ExporterCounter) bool {
+	return slices.ContainsFunc(slice, func(counter counters.Counter) bool {
+		return uint16(counter.FieldID) == uint16(fieldID)
+	})
 }
 
 // appendDCGMXIDErrorsCountDependency appends DCGM counters required for the DCGM_EXP_CLOCK_EVENTS_COUNT metric
-func appendDCGMClockEventsCountDependency(cs *dcgmexporter.CounterSet, allCounters []dcgmexporter.Counter) []dcgmexporter.Counter {
+func appendDCGMClockEventsCountDependency(
+	cs *counters.CounterSet, allCounters []counters.Counter,
+) []counters.Counter {
 	if len(cs.ExporterCounters) > 0 {
-		if containsField(cs.ExporterCounters, dcgmexporter.DCGMClockEventsCount) &&
-			!containsField(allCounters, dcgm.DCGM_FI_DEV_CLOCK_THROTTLE_REASONS) {
+		if containsExporterField(cs.ExporterCounters, counters.DCGMClockEventsCount) &&
+			!containsDCGMField(allCounters, dcgm.DCGM_FI_DEV_CLOCKS_EVENT_REASONS) {
 			allCounters = append(allCounters,
-				dcgmexporter.Counter{
-					FieldID: dcgm.DCGM_FI_DEV_CLOCK_THROTTLE_REASONS,
+				counters.Counter{
+					FieldID: dcgm.DCGM_FI_DEV_CLOCKS_EVENT_REASONS,
 				})
 		}
 	}
@@ -444,12 +589,14 @@ func appendDCGMClockEventsCountDependency(cs *dcgmexporter.CounterSet, allCounte
 }
 
 // appendDCGMXIDErrorsCountDependency appends DCGM counters required for the DCGM_EXP_XID_ERRORS_COUNT metric
-func appendDCGMXIDErrorsCountDependency(allCounters []dcgmexporter.Counter, cs *dcgmexporter.CounterSet) []dcgmexporter.Counter {
+func appendDCGMXIDErrorsCountDependency(
+	allCounters []counters.Counter, cs *counters.CounterSet,
+) []counters.Counter {
 	if len(cs.ExporterCounters) > 0 {
-		if containsField(cs.ExporterCounters, dcgmexporter.DCGMXIDErrorsCount) &&
-			!containsField(allCounters, dcgm.DCGM_FI_DEV_XID_ERRORS) {
+		if containsExporterField(cs.ExporterCounters, counters.DCGMXIDErrorsCount) &&
+			!containsDCGMField(allCounters, dcgm.DCGM_FI_DEV_XID_ERRORS) {
 			allCounters = append(allCounters,
-				dcgmexporter.Counter{
+				counters.Counter{
 					FieldID: dcgm.DCGM_FI_DEV_XID_ERRORS,
 				})
 		}
@@ -457,16 +604,11 @@ func appendDCGMXIDErrorsCountDependency(allCounters []dcgmexporter.Counter, cs *
 	return allCounters
 }
 
-func containsField(slice []dcgmexporter.Counter, fieldID dcgmexporter.ExporterCounter) bool {
-	return slices.ContainsFunc(slice, func(counter dcgmexporter.Counter) bool {
-		return counter.FieldID == dcgm.Short(fieldID)
-	})
-}
-
-func getCounters(config *dcgmexporter.Config) *dcgmexporter.CounterSet {
-	cs, err := dcgmexporter.GetCounterSet(config)
+func getCounters(config *appconfig.Config) *counters.CounterSet {
+	cs, err := counters.GetCounterSet(config)
 	if err != nil {
-		logrus.Fatal(err)
+		slog.Error(err.Error())
+		os.Exit(1)
 	}
 
 	// Copy labels from DCGM Counters to ExporterCounters
@@ -478,58 +620,20 @@ func getCounters(config *dcgmexporter.Config) *dcgmexporter.CounterSet {
 	return cs
 }
 
-func fillConfigMetricGroups(config *dcgmexporter.Config) {
+func fillConfigMetricGroups(config *appconfig.Config) {
 	var groups []dcgm.MetricGroup
-	groups, err := dcgm.GetSupportedMetricGroups(0)
+	groups, err := dcgmprovider.Client().GetSupportedMetricGroups(0)
 	if err != nil {
 		config.CollectDCP = false
-		logrus.Info("Not collecting DCP metrics: ", err)
+		slog.Info("Not collecting DCP metrics: " + err.Error())
 	} else {
-		logrus.Info("Collecting DCP Metrics")
+		slog.Info("Collecting DCP Metrics")
 		config.MetricGroups = groups
 	}
 }
 
-func enableDebugLogging(config *dcgmexporter.Config) {
-	if config.Debug {
-		// enable debug logging
-		logrus.SetLevel(logrus.DebugLevel)
-		logrus.Debug("Debug output is enabled")
-	}
-
-	logrus.Debugf("Command line: %s", strings.Join(os.Args, " "))
-
-	logrus.WithField(dcgmexporter.LoggerDumpKey, fmt.Sprintf("%+v", config)).Debug("Loaded configuration")
-}
-
-func initDCGM(config *dcgmexporter.Config) func() {
-	if config.UseRemoteHE {
-		logrus.Info("Attemping to connect to remote hostengine at ", config.RemoteHEInfo)
-		cleanup, err := dcgm.Init(dcgm.Standalone, config.RemoteHEInfo, "0")
-		if err != nil {
-			cleanup()
-			logrus.Fatal(err)
-		}
-		return cleanup
-	} else {
-
-		if config.EnableDCGMLog {
-			os.Setenv("__DCGM_DBG_FILE", "-")
-			os.Setenv("__DCGM_DBG_LVL", config.DCGMLogLevel)
-		}
-
-		cleanup, err := dcgm.Init(dcgm.Embedded)
-		if err != nil {
-			cleanup()
-			logrus.Fatal(err)
-		}
-
-		return cleanup
-	}
-}
-
-func parseDeviceOptions(devices string) (dcgmexporter.DeviceOptions, error) {
-	var dOpt dcgmexporter.DeviceOptions
+func parseDeviceOptions(devices string) (appconfig.DeviceOptions, error) {
+	var dOpt appconfig.DeviceOptions
 
 	letterAndRange := strings.Split(devices, ":")
 	count := len(letterAndRange)
@@ -591,7 +695,7 @@ func parseDeviceOptions(devices string) (dcgmexporter.DeviceOptions, error) {
 	return dOpt, nil
 }
 
-func contextToConfig(c *cli.Context) (*dcgmexporter.Config, error) {
+func contextToConfig(c *cli.Context) (*appconfig.Config, error) {
 	gOpt, err := parseDeviceOptions(c.String(CLIGPUDevices))
 	if err != nil {
 		return nil, err
@@ -608,36 +712,107 @@ func contextToConfig(c *cli.Context) (*dcgmexporter.Config, error) {
 	}
 
 	dcgmLogLevel := c.String(CLIDCGMLogLevel)
-	if !slices.Contains(dcgmexporter.DCGMDbgLvlValues, dcgmLogLevel) {
+	if !slices.Contains(DCGMDbgLvlValues, dcgmLogLevel) {
 		return nil, fmt.Errorf("invalid %s parameter value: %s", CLIDCGMLogLevel, dcgmLogLevel)
 	}
 
-	return &dcgmexporter.Config{
-		CollectorsFile:             c.String(CLIFieldsFile),
-		Address:                    c.String(CLIAddress),
-		CollectInterval:            c.Int(CLICollectInterval),
-		Kubernetes:                 c.Bool(CLIKubernetes),
-		KubernetesGPUIdType:        dcgmexporter.KubernetesGPUIDType(c.String(CLIKubernetesGPUIDType)),
-		CollectDCP:                 true,
-		UseOldNamespace:            c.Bool(CLIUseOldNamespace),
-		UseRemoteHE:                c.IsSet(CLIRemoteHEInfo),
-		RemoteHEInfo:               c.String(CLIRemoteHEInfo),
-		GPUDevices:                 gOpt,
-		SwitchDevices:              sOpt,
-		CPUDevices:                 cOpt,
-		NoHostname:                 c.Bool(CLINoHostname),
-		UseFakeGPUs:                c.Bool(CLIUseFakeGPUs),
-		ConfigMapData:              c.String(CLIConfigMapData),
-		WebSystemdSocket:           c.Bool(CLIWebSystemdSocket),
-		WebConfigFile:              c.String(CLIWebConfigFile),
-		XIDCountWindowSize:         c.Int(CLIXIDCountWindowSize),
-		ReplaceBlanksInModelName:   c.Bool(CLIReplaceBlanksInModelName),
-		Debug:                      c.Bool(CLIDebugMode),
-		ClockEventsCountWindowSize: c.Int(CLIClockEventsCountWindowSize),
-		EnableDCGMLog:              c.Bool(CLIEnableDCGMLog),
-		DCGMLogLevel:               dcgmLogLevel,
-		PodResourcesKubeletSocket:  c.String(CLIPodResourcesKubeletSocket),
-		HPCJobMappingDir:           c.String(CLIHPCJobMappingDir),
-		NvidiaResourceNames:        c.StringSlice(CLINvidiaResourceNames),
+	return &appconfig.Config{
+		CollectorsFile:                   c.String(CLIFieldsFile),
+		Address:                          c.String(CLIAddress),
+		CollectInterval:                  c.Int(CLICollectInterval),
+		Kubernetes:                       c.Bool(CLIKubernetes),
+		KubernetesEnablePodLabels:        c.Bool(CLIKubernetesEnablePodLabels),
+		KubernetesEnablePodUID:           c.Bool(CLIKubernetesEnablePodUID),
+		KubernetesGPUIdType:              appconfig.KubernetesGPUIDType(c.String(CLIKubernetesGPUIDType)),
+		KubernetesPodLabelAllowlistRegex: c.StringSlice(CLIKubernetesPodLabelAllowlistRegex),
+		KubernetesPodLabelCacheSize:      c.Int(CLIKubernetesPodLabelCacheSize),
+		CollectDCP:                       true,
+		UseOldNamespace:                  c.Bool(CLIUseOldNamespace),
+		UseRemoteHE:                      c.IsSet(CLIRemoteHEInfo),
+		RemoteHEInfo:                     c.String(CLIRemoteHEInfo),
+		GPUDeviceOptions:                 gOpt,
+		SwitchDeviceOptions:              sOpt,
+		CPUDeviceOptions:                 cOpt,
+		NoHostname:                       c.Bool(CLINoHostname),
+		UseFakeGPUs:                      c.Bool(CLIUseFakeGPUs),
+		ConfigMapData:                    c.String(CLIConfigMapData),
+		WebSystemdSocket:                 c.Bool(CLIWebSystemdSocket),
+		WebConfigFile:                    c.String(CLIWebConfigFile),
+		XIDCountWindowSize:               c.Int(CLIXIDCountWindowSize),
+		ReplaceBlanksInModelName:         c.Bool(CLIReplaceBlanksInModelName),
+		Debug:                            c.Bool(CLIDebugMode),
+		ClockEventsCountWindowSize:       c.Int(CLIClockEventsCountWindowSize),
+		EnableDCGMLog:                    c.Bool(CLIEnableDCGMLog),
+		DCGMLogLevel:                     dcgmLogLevel,
+		PodResourcesKubeletSocket:        c.String(CLIPodResourcesKubeletSocket),
+		HPCJobMappingDir:                 c.String(CLIHPCJobMappingDir),
+		NvidiaResourceNames:              c.StringSlice(CLINvidiaResourceNames),
+		KubernetesVirtualGPUs:            c.Bool(CLIKubernetesVirtualGPUs),
+		DumpConfig: appconfig.DumpConfig{
+			Enabled:     c.Bool(CLIDumpEnabled),
+			Directory:   c.String(CLIDumpDirectory),
+			Retention:   c.Int(CLIDumpRetention),
+			Compression: c.Bool(CLIDumpCompression),
+		},
+		KubernetesEnableDRA:    c.Bool(CLIKubernetesEnableDRA),
+		DisableStartupValidate: c.Bool(CLIDisableStartupValidate),
 	}, nil
+}
+
+func watchCollectorsFile(filePath string, onChange func()) {
+	slog.Info("Watching for changes in file", slog.String("file", filePath))
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		slog.Error("Error creating watcher", slog.String("error", err.Error()))
+	}
+	defer watcher.Close()
+
+	dir := filepath.Dir(filePath)
+	file := filepath.Base(filePath)
+
+	err = watcher.Add(dir)
+	if err != nil {
+		slog.Error("Error adding dir to watcher", slog.String("error", err.Error()))
+	}
+
+	go func() {
+		var lastModTime time.Time
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					slog.Error("Error reading events from watcher")
+					return
+				}
+
+				if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) != 0 {
+					if filepath.Base(event.Name) == file {
+						time.Sleep(200 * time.Millisecond)
+						info, err := os.Stat(filepath.Join(dir, file))
+						if err == nil {
+							modTime := info.ModTime()
+							if modTime != lastModTime {
+								lastModTime = modTime
+								onChange()
+							}
+						}
+					}
+				}
+
+			case _, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+			}
+		}
+	}()
+	select {}
+}
+
+func reloadMetricsServer(s chan os.Signal) func() {
+	// all we have to do is send a sighup
+	return func() {
+		slog.Info("Reloading metrics server")
+		s <- syscall.SIGHUP
+	}
 }

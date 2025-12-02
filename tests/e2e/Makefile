@@ -16,8 +16,10 @@ GO_CMD ?= go
 NAMESPACE ?= "dcgm-exporter"
 CHART ?= "./../../deployment/"
 IMAGE_REPOSITORY ?= "nvcr.io/nvidia/k8s/dcgm-exporter"
-IMAGE_TAG ?= "3.3.7-3.5.0-ubuntu22.04"
+IMAGE_TAG ?= "4.4.2-4.7.0-distroless"
 KUBECONFIG ?= "~/.kube/config"
+RUNTIME_CLASS ?= ""
+NO_CLEANUP ?= "false"
 
 define TEST_CMD
 	@if [ -z ${KUBECONFIG} ]; then \
@@ -32,7 +34,9 @@ define TEST_CMD
 		-chart="$(CHART)" \
 		-namespace=$(NAMESPACE) \
 		-image-repository=$(IMAGE_REPOSITORY) \
-		-image-tag=$(IMAGE_TAG)
+		-image-tag=$(IMAGE_TAG) \
+		-runtime-class=$(RUNTIME_CLASS) \
+		-no-cleanup=$(NO_CLEANUP)
 endef
 
 .PHONY: e2e-test
@@ -44,6 +48,29 @@ e2e-test:
 e2e-test-no-profiling:
 	@$(TEST_CMD) \
 		-arguments="{-f=/etc/dcgm-exporter/default-counters.csv}"
+
+.PHONY: e2e-basic-auth
+e2e-basic-auth:
+	@$(TEST_CMD) \
+		-arguments="{-f=/etc/dcgm-exporter/default-counters.csv}" \
+		--ginkgo.label-filter=basicAuth
+
+.PHONY: e2e-tls
+e2e-tls:
+	@$(TEST_CMD) \
+		-arguments="{-f=/etc/dcgm-exporter/default-counters.csv}" \
+		--ginkgo.label-filter=tls
+
+.PHONY: e2e-default
+e2e-default:
+	@$(TEST_CMD) \
+		-arguments="{-f=/etc/dcgm-exporter/default-counters.csv}" \
+		--ginkgo.label-filter=default
+
+e2e-labels:
+	@$(TEST_CMD) \
+		-arguments="{-f=/etc/dcgm-exporter/default-counters.csv}" \
+		--ginkgo.label-filter=labels
 
 binary:
 	go test -c --tags="e2e" .
